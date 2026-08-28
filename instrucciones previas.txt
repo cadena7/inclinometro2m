@@ -1,0 +1,16 @@
+Python Installation of BNO055 I2C Library
+sudo pip3 install adafruit-circuitpython-bno055
+
+To use this sensor, you must enable i2c slowdown on the Raspberry Pi device tree overlay.
+sudo nano /boot/config.txt
+
+*agregar debajo de:
+# Uncomment some of all of these to enable the optional hardware interfaces
+dtparam=i2c_arm=on
+dtparam=i2s=on
+dtparam=spi=on
+
+# Clock stretching by slowing down to 20KHz
+dtparam=i2c_arm_baudrate=20000.
+
+sudo reboot

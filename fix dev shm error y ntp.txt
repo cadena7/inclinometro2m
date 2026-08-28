@@ -1,0 +1,31 @@
+Fecha   27 enero 2025
+
+*************************************************
+Fix el bug que borra el socket de /dev/shm
+*************************************************
+Edit /etc/systemd/logind.conf:
+sudo nano /etc/systemd/logind.conf
+
+uncomment the line RemoveIPC=yes, 
+change it to RemoveIPC=no, save, and reboot the system:
+
+requires a restart:
+
+sudo systemctl restart systemd-logind
+
+
+*************************************************
+Sincronizar el tiempo con el NTP local
+*************************************************
+editar este archivo:
+sudo nano /etc/systemd/timesyncd.conf
+
+Poner ip del servidor local de tiempo (en cada telescopio cambia)
+NTP=192.168.0.254
+FallbackNTP=192.168.0.254
+
+sudo timedatectl set-ntp true
+
+sudo systemctl restart systemd-timesyncd
+
+sudo timedatectl status

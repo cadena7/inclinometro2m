@@ -1,0 +1,1040 @@
+#!/usr/bin/env python3
+
+'''
+INCLINOMETRO PARA EL TELESCOPIO DE 2.1M
+Version 0.8-dev          23/Mayo/2025
+Edgar Omar Cadena Zepeda
+IA-UNAM-ENS
+cadena@astro.unam.mx
+
+Código para la lectura de un sensor Adafruit BNO055, utilizado como inclinometro,
+en el telescopio de 2.1m.
+
+El sensor es leido mediante un código en lenguaje Python 3,
+basado en una microcomputadora de la línea Raspberry Pi 3 modelo B.
+
+El sensor se posiciona con las letras BNO055 del integrado apuntando al sur,
+leidas desde el lado norte.
+
+Comandos que Ejecuta el Servidor:
+":ABRIR;" Abrir tapas del espejo primario y buscador.
+":CERRAR;" Cerrar tapas del espejo primario y buscador.
+":AB;" Abrir buscador.
+":CB;" Cerrar buscador.
+"INCLINOMETRO" Envia los valores del inclinometro de DEC y AH en un diccionario JSON
+
+Nota de Operacion del Telescopio:
+Abre primero Tapa Norte, luego la Tapa Sur
+Cierra primero Tapa Sur, luego la Tapa Norte
+
+Ejemplos de instrucciones:
+echo :ABRIR; | nc 192.168.0.20 4545
+echo OPENALL | nc 192.168.0.20 4545
+
+echo :CERRAR; | nc 192.168.0.20 4545
+echo CLOSEALL | nc 192.168.0.20 4545
+
+echo OPENTAPAS | nc 192.168.0.20 4545
+echo CLOSETAPAS | nc 192.168.0.20 4545
+
+echo OPENBUSCA | nc 192.168.0.20 4545
+echo CLOSEBUSCA | nc 192.168.0.20 4545
+
+echo INCLINOMETRO 1 | nc 192.168.0.20 4545
+echo INCLINOMETRO 10 | nc 192.168.0.20 4545
+echo INCLINOMETRO 100 | nc 192.168.0.20 4545
+
+echo DATA | nc 192.168.0.20 4545
+
+echo ESTADO | nc 192.168.0.20 4545
+echo STATUS | nc 192.168.0.20 4545
+
+echo CALIBRA | nc 192.168.0.20 4545
+
+echo OFFSETS | nc 192.168.0.20 4545
+
+
+Funciones Añadidas:
+Ver. 0.8 - Añadi un timer global para el timeout de los motores
+Ver. 0.7 - Fix errores de lectura del acelerometro
+Ver. 0.6 - Ajuste de tiempos de aperturas en sitio
+Ver. 0.5 - Funcion que genera archivo de calibración añadida
+Ver. 0.4 - Lee archivo de offsets de calibración
+Ver. 0.3 - Nuevas entradas para switches del buscador
+Ver. 0.2 - Funcion de filtro de promedio en el inclinometro
+Ver. 0.1 - Implementada
+'''
+
+import sys
+import time
+import board
+import serial
+#import adafruit_bno055
+from Adafruit_BNO055 import BNO055
+import math
+import simplejson as json
+from datetime import timedelta
+from threading import Thread, Timer
+import socket
+import RPi.GPIO as GPIO
+
+import Inclinometro2m_variables
+
+# GPIOS Entradas
+TAPA_NORTE_ABIERTA_PIN = 5
+TAPA_NORTE_CERRADA_PIN = 6
+TAPA_SUR_ABIERTA_PIN = 13
+TAPA_SUR_CERRADA_PIN = 26
+BUSCA_ABIERTO_PIN = 23
+BUSCA_CERRADO_PIN = 24
+
+# GPIOS Salidas
+ABRE_BUSCADOR_PIN = 4
+CIERRA_BUSCADOR_PIN = 17
+ABRE_TAPA_NORTE_PIN = 27
+CIERRA_TAPA_NORTE_PIN = 22
+ABRE_TAPA_SUR_PIN = 10
+CIERRA_TAPA_SUR_PIN = 9
+
+# Pin Setup:
+GPIO.setmode(GPIO.BCM) # Broadcom pin-numbering scheme                         # GPIO pulled down, detecta  3.3V con la interrupcion
+GPIO.setwarnings(False)
+GPIO.setup(TAPA_NORTE_ABIERTA_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)       #5  Pull_down
+GPIO.setup(TAPA_NORTE_CERRADA_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)       #6  Pull_down
+GPIO.setup(TAPA_SUR_ABIERTA_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)          #13  Pull_down
+GPIO.setup(TAPA_SUR_CERRADA_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)         #26  Pull_down
+GPIO.setup(BUSCA_ABIERTO_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)          #23  Pull_down
+GPIO.setup(BUSCA_CERRADO_PIN, GPIO.IN, pull_up_down=GPIO.PUD_DOWN)         #24 Pull_down
+
+GPIO.setup(ABRE_BUSCADOR_PIN, GPIO.OUT)                                #4
+GPIO.setup(CIERRA_BUSCADOR_PIN, GPIO.OUT)                             #17
+GPIO.setup(ABRE_TAPA_NORTE_PIN, GPIO.OUT)                             #27
+GPIO.setup(CIERRA_TAPA_NORTE_PIN, GPIO.OUT)                           #22
+GPIO.setup(ABRE_TAPA_SUR_PIN, GPIO.OUT)                               #10
+GPIO.setup(CIERRA_TAPA_SUR_PIN, GPIO.OUT)                             #9
+
+TapasTimer = None
+BuscadorTimer = None
+
+
+# If you are going to use I2C uncomment these lines
+#i2c = board.I2C()
+#sensor = adafruit_bno055.BNO055_I2C(i2c)
+
+# If you are going to use UART uncomment these lines
+#uart = serial.Serial("/dev/serial0")
+#sensor = adafruit_bno055.BNO055_UART(uart)
+
+sensor = BNO055.BNO055(serial_port='/dev/ttyS0')
+# Enable verbose debug logging if -v is passed as a parameter.
+if len(sys.argv) == 2 and sys.argv[1].lower() == '-v':
+    logging.basicConfig(level=logging.DEBUG)
+# Initialize the BNO055 and stop if something went wrong.
+if not sensor.begin():
+    raise RuntimeError('Failed to initialize BNO055! Is the sensor connected?')
+# Print system status and self test result.
+status, self_test, error = sensor.get_system_status()
+print('System status: {0}'.format(status))
+print('Self test result (0x0F is normal): 0x{0:02X}'.format(self_test))
+# Print out an error if system status is in error mode.
+if status == 0x01:
+    print('System error: {0}'.format(error))
+    print('See datasheet section 4.3.59 for the meaning.')
+# Print BNO055 software revision and other diagnostic data.
+sw, bl, accel, mag, gyro = sensor.get_revision()
+print('Software version:   {0}'.format(sw))
+print('Bootloader version: {0}'.format(bl))
+print('Accelerometer ID:   0x{0:02X}'.format(accel))
+print('Magnetometer ID:    0x{0:02X}'.format(mag))
+print('Gyroscope ID:       0x{0:02X}\n'.format(gyro))
+# Read the Euler angles for heading, roll, pitch (all in degrees).
+heading, roll, pitch = sensor.read_euler()
+# Read the calibration status, 0=uncalibrated and 3=fully calibrated.
+sys, gyro, accel, mag = sensor.get_calibration_status()
+# Print everything out.
+print('Heading={0:0.2F} Roll={1:0.2F} Pitch={2:0.2F}\tSys_cal={3} Gyro_cal={4} Accel_cal={5} Mag_cal={6}'.format(
+          heading, roll, pitch, sys, gyro, accel, mag))
+
+# Multithreaded Python server : TCP Server Socket Program Stub
+IP = "192.168.0.20"
+TCP_IP = "0.0.0.0"
+TCP_PORT = 4545     # Para compatibilidad con la electronica anterior
+BUFFER_SIZE = 2048  # Usually 1024, but we need quick response
+
+# create an INET, STREAMing socket
+tcpServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+tcpServer.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+# bind the socket to a public host, and a well-known port
+tcpServer.bind((TCP_IP, TCP_PORT))
+#threads = []
+
+TapasTimeout = 25      # tiempo limite de energizar actuadores de las tapas
+BuscadorTimeout = 4      # tiempo limite de energizar motor del buscador
+
+
+# Funciones normales
+# Apaga todos los motores
+def turnOffMotors():
+    print ("[+] apaga Todos Motores")
+    time.sleep(0.20)
+    GPIO.output(ABRE_TAPA_NORTE_PIN, GPIO.LOW)
+    GPIO.output(CIERRA_TAPA_NORTE_PIN, GPIO.LOW)
+    GPIO.output(ABRE_TAPA_SUR_PIN, GPIO.LOW)
+    GPIO.output(CIERRA_TAPA_SUR_PIN, GPIO.LOW)
+    GPIO.output(ABRE_BUSCADOR_PIN, GPIO.LOW)
+    GPIO.output(CIERRA_BUSCADOR_PIN, GPIO.LOW)
+    variables.TAPA_NORTE_STOP = 1
+    variables.TAPA_SUR_STOP = 1
+    variables.BUSCADOR_STOP = 1
+
+# Apaga el motor de la tapaNorte
+def turnOffTapaNorte():
+    print ("[+] apaga TapaNorte")
+    time.sleep(0.20)
+    GPIO.output(ABRE_TAPA_NORTE_PIN, GPIO.LOW)
+    GPIO.output(CIERRA_TAPA_NORTE_PIN, GPIO.LOW)
+    variables.TAPA_NORTE_STOP = 1
+
+# Apaga el motor de la tapaNorte por Timeout
+def turnOffTapaNorteTimeout():
+    if GPIO.input(TAPA_NORTE_ABIERTA_PIN) or GPIO.input(TAPA_NORTE_CERRADA_PIN):
+        print ("[+] TapaNorte llego antes del Timeout")
+    else:
+        print ("[-] Apagando TapaNorte no llego por Timeout")
+        time.sleep(0.20)
+        turnOffTapaNorte()
+        variables.TAPA_NORTE_STOP = 1
+
+# abre tapaNorte
+def abreTapaNorte():
+    global TapasTimer
+    variables.ABRE_TAPA_NORTE = 1
+    variables.CIERRA_TAPA_NORTE = 0
+    if GPIO.input(TAPA_NORTE_ABIERTA_PIN):
+        variables.TAPA_NORTE_ABIERTA = 1
+        print ("[+] TapaNorte ya abierta")
+        turnOffTapaNorte()
+    else:
+        turnOffTapaNorte()
+        time.sleep(0.20)
+        variables.TAPA_NORTE_ABIERTA = 0
+        print ("[+] abre TapaNorte")
+        time.sleep(0.20)
+        GPIO.output(ABRE_TAPA_NORTE_PIN, GPIO.HIGH)
+        variables.TAPA_NORTE_STOP = 0
+        TapasTimer = Timer(TapasTimeout, turnOffTapaNorteTimeout)
+        TapasTimer.start()  # after TapasTimeout seconds, turnOffTapaNorteTimeout() will be executed
+
+# cierra tapaNorte
+def cierraTapaNorte():
+    global TapasTimer
+    variables.ABRE_TAPA_NORTE = 0
+    variables.CIERRA_TAPA_NORTE = 1
+    if GPIO.input(TAPA_NORTE_CERRADA_PIN):
+        variables.TAPA_NORTE_CERRADA = 1
+        print ("[+] TapaNorte ya cerrada")
+        turnOffTapaNorte()
+    else:
+        turnOffTapaNorte()
+        time.sleep(0.20)
+        variables.TAPA_NORTE_CERRADA = 0
+        print ("[+] cierra TapaNorte")
+        time.sleep(0.20)
+        GPIO.output(CIERRA_TAPA_NORTE_PIN, GPIO.HIGH)
+        variables.TAPA_NORTE_STOP = 0
+        TapasTimer = Timer(TapasTimeout, turnOffTapaNorteTimeout)
+        TapasTimer.start()  # after TapasTimeout seconds, turnOffTapaNorteTimeout() will be executed
+
+# Apaga el motor de la tapaSur
+def turnOffTapaSur():
+    print ("[+] apaga TapaSur")
+    time.sleep(0.20)
+    GPIO.output(ABRE_TAPA_SUR_PIN, GPIO.LOW)
+    GPIO.output(CIERRA_TAPA_SUR_PIN, GPIO.LOW)
+    variables.TAPA_SUR_STOP = 1
+
+# Apaga el motor de la tapaSur por Timeout
+def turnOffTapaSurTimeout():
+    if GPIO.input(TAPA_SUR_ABIERTA_PIN) or GPIO.input(TAPA_SUR_CERRADA_PIN):
+        print ("[+] TapaSur llego antes del Timeout")
+    else:
+        print ("[-] Apagando TapaSur no llego por Timeout")
+        time.sleep(0.20)
+        turnOffTapaSur()
+        variables.TAPA_SUR_STOP = 1
+
+# abre tapaSur
+def abreTapaSur():
+    global TapasTimer
+    variables.ABRE_TAPA_SUR = 1
+    variables.CIERRA_TAPA_SUR = 0
+    if GPIO.input(TAPA_SUR_ABIERTA_PIN):
+        variables.TAPA_SUR_ABIERTA = 1
+        print ("[+] TapaSur ya abierta")
+        turnOffTapaSur()
+    else:
+        turnOffTapaSur()
+        time.sleep(0.20)
+        variables.TAPA_SUR_ABIERTA = 0
+        print ("[+] abre TapaSur")
+        time.sleep(0.20)
+        GPIO.output(ABRE_TAPA_SUR_PIN, GPIO.HIGH)
+        variables.TAPA_SUR_STOP = 0
+        TapasTimer = Timer(TapasTimeout, turnOffTapaSurTimeout)
+        TapasTimer.start()  # after TapasTimeout seconds, turnOffTapaSurTimeout() will be executed
+
+# cierra tapaSur
+def cierraTapaSur():
+    global TapasTimer
+    variables.ABRE_TAPA_SUR = 0
+    variables.CIERRA_TAPA_SUR = 1
+    if GPIO.input(TAPA_SUR_CERRADA_PIN):
+        variables.TAPA_SUR_CERRADA = 1
+        print ("[+] TapaSur ya cerrada")
+        turnOffTapaSur()
+    else:
+        turnOffTapaSur()
+        time.sleep(0.20)
+        variables.TAPA_SUR_CERRADA = 0
+        print ("[+] cierra tapaSur")
+        time.sleep(0.20)
+        GPIO.output(CIERRA_TAPA_SUR_PIN, GPIO.HIGH)
+        variables.TAPA_SUR_STOP = 0
+        TapasTimer = Timer(TapasTimeout, turnOffTapaSurTimeout)
+        TapasTimer.start()  # after TapasTimeout seconds, turnOffTapaSurTimeout() will be executed
+
+# Apaga el motor de la Buscador
+def turnOffBuscador():
+    print ("[+] apaga Buscador")
+    time.sleep(0.20)
+    GPIO.output(ABRE_BUSCADOR_PIN, GPIO.LOW)
+    GPIO.output(CIERRA_BUSCADOR_PIN, GPIO.LOW)
+    variables.BUSCADOR_STOP = 1
+
+# Apaga el motor de la Buscador por Timeout
+def turnOffBuscadorTimeout():
+    print ("[-] Apagando Buscador no llego por Timeout")
+    time.sleep(0.20)
+    turnOffBuscador()
+    variables.BUSCADOR_STOP = 1
+
+# abre Buscador
+def abreBuscador():
+    global BuscadorTimer
+    variables.ABRE_BUSCADOR = 1
+    variables.CIERRA_BUSCADOR = 0
+    if GPIO.input(BUSCA_ABIERTO_PIN):
+        variables.BUSCA_ABIERTO = 1
+        print ("[+] Buscador ya abierto")
+        turnOffBuscador()
+    else:
+        turnOffBuscador()
+        time.sleep(0.20)
+        print ("[+] abre Buscador")
+        time.sleep(0.20)
+        GPIO.output(ABRE_BUSCADOR_PIN, GPIO.HIGH)
+        variables.BUSCADOR_STOP = 0
+        BuscadorTimer = Timer(BuscadorTimeout, turnOffBuscadorTimeout)
+        # after BuscadorTimeout seconds, turnOffBuscadorTimeout() will be executed
+        BuscadorTimer.start()
+
+# cierra Buscador
+def cierraBuscador():
+    global BuscadorTimer
+    variables.ABRE_BUSCADOR = 0
+    variables.CIERRA_BUSCADOR = 1
+    if GPIO.input(BUSCA_CERRADO_PIN):
+        variables.BUSCA_CERRADO = 1
+        print ("[+] Buscador ya cerrado")
+        turnOffBuscador()
+    else:
+        turnOffBuscador()
+        time.sleep(0.20)
+        print ("[+] cierra Buscador")
+        time.sleep(0.20)
+        GPIO.output(CIERRA_BUSCADOR_PIN, GPIO.HIGH)
+        variables.BUSCADOR_STOP = 0
+        BuscadorTimer = Timer(BuscadorTimeout, turnOffBuscadorTimeout)
+        # after BuscadorTimeout seconds, turnOffBuscadorTimeout() will be executed
+        BuscadorTimer.start()
+
+
+#Clase Principal
+class Principal():
+    def __init__(self):
+        print ("[+] Variables del programa Cargadas")
+
+    # Funciones Callback
+    # these will run in another thread when our events are detected
+    def TAPA_NORTE_ABIERTA(self, channel):    #switch normalmente abierto
+        time.sleep(0.005) # debounce for 5mSec
+        if GPIO.input(TAPA_NORTE_ABIERTA_PIN):
+            variables.TAPA_NORTE_ABIERTA = 1
+            print (">>rising edge detectado en TAPA_NORTE_ABIERTA_PIN>>")
+            print ("[+] abrioTapaNorte")
+            turnOffTapaNorte()
+        else:
+            variables.TAPA_NORTE_ABIERTA = 0
+            print ("<<falling edge detectado on TAPA_NORTE_ABIERTA_PIN<<")
+
+
+    def TAPA_NORTE_CERRADA(self, channel):    #switch normalmente abierto
+        time.sleep(0.005) # debounce for 5mSec
+        if GPIO.input(TAPA_NORTE_CERRADA_PIN):
+            variables.TAPA_NORTE_CERRADA = 1
+            print (">>rising edge detectado on TAPA_NORTE_CERRADA_PIN>>")
+            print ("[+] cerroTapaNorte")
+            turnOffTapaNorte()
+        else:
+            variables.TAPA_NORTE_CERRADA = 0
+            print ("<<falling edge detectado on TAPA_SWITCH_CERRADA_PIN<<")
+
+
+    def TAPA_SUR_ABIERTA(self, channel):    #switch normalmente abierto
+        time.sleep(0.005) # debounce for 5mSec
+        if GPIO.input(TAPA_SUR_ABIERTA_PIN):
+            variables.TAPA_SUR_ABIERTA = 1
+            print (">>rising edge detectado en TAPA_SUR_ABIERTA_PIN>>")
+            print ("[+] abrioTapaSur")
+            turnOffTapaSur()
+        else:
+            variables.TAPA_SUR_ABIERTA = 0
+            print ("<<falling edge detectado on TAPA_SUR_ABIERTA_PIN<<")
+
+
+    def TAPA_SUR_CERRADA(self, channel):    #switch normalmente abierto
+        time.sleep(0.005) # debounce for 5mSec
+        if GPIO.input(TAPA_SUR_CERRADA_PIN):
+            variables.TAPA_SUR_CERRADA = 1
+            print (">>rising edge detectado on TAPA_SUR_CERRADA_PIN>>")
+            print ("[+] cerroTapaSur")
+            turnOffTapaSur()
+        else:
+            variables.TAPA_SUR_CERRADA = 0
+            print ("<<falling edge detectado on TAPA_SUR_CERRADA_PIN<<")
+
+
+    def BUSCA_ABIERTO(self, channel):    #switch normalmente abierto
+        time.sleep(0.005) # debounce for 5mSec
+        if GPIO.input(BUSCA_ABIERTO_PIN):
+            variables.BUSCA_ABIERTO = 1
+            print (">>rising edge detectado on BUSCA_ABIERTO_PIN>>")
+            print ("[+] abrioBuscador")
+            turnOffBuscador()
+        else:
+            variables.BUSCA_ABIERTO = 0
+            print ("<<falling edge detectado on BUSCA_ABIERTO_PIN<<")
+
+
+    def BUSCA_CERRADO(self, channel):    #switch normalmente abierto
+        time.sleep(0.005) # debounce for 5mSec
+        if GPIO.input(BUSCA_CERRADO_PIN):
+            variables.BUSCA_CERRADO = 1
+            print (">>rising edge detectado en BUSCA_CERRADO_PIN>>")
+            print ("[+] cerroBuscador")
+            turnOffBuscador()
+        else:
+            variables.BUSCA_CERRADO = 0
+            print ("<<falling edge detectado on BUSCA_CERRADO_PIN<<")
+
+
+
+    # Detectamos interrupciones
+    def initInterrupciones(self):
+        # when a rising edge is detected on gpio, regardless of whatever
+        # else is happening in the program, the function my_callback will be run
+        GPIO.add_event_detect(TAPA_NORTE_ABIERTA_PIN, GPIO.BOTH, callback=self.TAPA_NORTE_ABIERTA, bouncetime=200)
+        GPIO.add_event_detect(TAPA_NORTE_CERRADA_PIN, GPIO.BOTH, callback=self.TAPA_NORTE_CERRADA, bouncetime=200)
+        GPIO.add_event_detect(TAPA_SUR_ABIERTA_PIN, GPIO.BOTH, callback=self.TAPA_SUR_ABIERTA, bouncetime=200)
+        GPIO.add_event_detect(TAPA_SUR_CERRADA_PIN, GPIO.BOTH, callback=self.TAPA_SUR_CERRADA, bouncetime=200)
+        GPIO.add_event_detect(BUSCA_ABIERTO_PIN, GPIO.BOTH, callback=self.BUSCA_ABIERTO, bouncetime=200)
+        GPIO.add_event_detect(BUSCA_CERRADO_PIN, GPIO.BOTH, callback=self.BUSCA_CERRADO, bouncetime=200)
+
+
+    # Estado inicial de los interruptores
+    def initStatus(self):
+        variables.TAPA_NORTE_ABIERTA = GPIO.input(TAPA_NORTE_ABIERTA_PIN)
+        variables.TAPA_NORTE_CERRADA = GPIO.input(TAPA_NORTE_CERRADA_PIN)
+        variables.TAPA_SUR_ABIERTA = GPIO.input(TAPA_SUR_ABIERTA_PIN)
+        variables.TAPA_SUR_CERRADA = GPIO.input(TAPA_SUR_CERRADA_PIN)
+        variables.BUSCA_ABIERTO = GPIO.input(BUSCA_ABIERTO_PIN)
+        variables.BUSCA_CERRADO = GPIO.input(BUSCA_CERRADO_PIN)
+        variables.ABRE_BUSCADOR = 0
+        variables.CIERRA_BUSCADOR = 0
+        variables.ABRE_TAPA_NORTE = 0
+        variables.CIERRA_TAPA_NORTE = 0
+        variables.ABRE_TAPA_SUR = 0
+        variables.CIERRA_TAPA_SUR = 0
+        variables.TAPA_NORTE_STOP = 0
+        variables.TAPA_SUR_STOP = 0
+        variables.BUSCADOR_STOP = 0
+
+        estado = {
+                'TAPA_NORTE_ABIERTA': variables.TAPA_NORTE_ABIERTA,
+                'TAPA_NORTE_CERRADA': variables.TAPA_NORTE_CERRADA,
+                'TAPA_SUR_ABIERTA': variables.TAPA_SUR_ABIERTA,
+                'TAPA_SUR_CERRADA': variables.TAPA_SUR_CERRADA,
+                'BUSCADOR_ABIERTO': variables.BUSCA_ABIERTO,
+                'BUSCADOR_CERRADO': variables.BUSCA_CERRADO,
+                'ABRE_BUSCADOR': variables.ABRE_BUSCADOR,
+                'CIERRA_BUSCADOR': variables.CIERRA_BUSCADOR,
+                'ABRE_TAPA_NORTE': variables.ABRE_TAPA_NORTE,
+                'CIERRA_TAPA_NORTE': variables.CIERRA_TAPA_NORTE,
+                'ABRE_TAPA_SUR': variables.ABRE_TAPA_SUR,
+                'CIERRA_TAPA_SUR': variables.CIERRA_TAPA_SUR,
+                'TAPA_NORTE_STOP': variables.TAPA_NORTE_STOP,
+                'TAPA_SUR_STOP': variables.TAPA_SUR_STOP,
+                'BUSCADOR_STOP': variables.BUSCADOR_STOP
+                }
+        estado_json = json.dumps(estado, separators=(',', ':'), sort_keys=True) #data serialized
+        print ("[+] Estado inicial: ")
+        print (estado_json)
+
+
+    def run(self):
+        self.initInterrupciones()
+        time.sleep(0.20)
+        print ("[+] Iniciando Servicio de Interrupciones OK")
+        try:
+            self.initStatus()
+        except:
+            print ("[-] ERROR de inicializacion del Servicio de Interrupciones")
+            pass
+        time.sleep(0.20)
+
+
+def inclinometroPromediado(iteraciones):
+    xtempval = 0
+    ytempval = 0
+    ztempval = 0
+    data = 0
+    FirstInitSensor()
+
+    for i in range(iteraciones):
+        try:
+            #data = sensor.acceleration
+            data = sensor.read_accelerometer()
+        except:
+            data = 0
+            print ("[*]ERROR - Mala lectura del sensor")
+            pass
+        xtempval = xtempval + data[0]
+        ytempval = ytempval + data[1]
+        ztempval = ztempval + data[2]
+        time.sleep(0.01)
+
+    x = xtempval / iteraciones
+    y = ytempval / iteraciones
+    z = ztempval / iteraciones
+
+    try:
+        angleYZ = math.atan( y / math.sqrt(x**2 + z**2))
+        angleYZ = angleYZ*(180.0/math.pi) # Convierte de radianes a grados
+        angleYZ = angleYZ/15
+        AH = angleYZ
+
+        angleXZ = math.atan(x / math.sqrt(y**2+z**2))
+        angleXZ = angleXZ*(180.0/math.pi) # Convierte de radianes a grados
+        angleXZ = angleXZ + 31.02025  # Latitud OAN-SPM
+        DEC = angleXZ
+    except:
+        AH = 0
+        DEC = 0
+        print ("[*]ERROR - Calculando datos del sensor")
+        pass
+
+    try:
+        with open('/home/pi/Inclinometro2m/offset.json') as offsetsfile:
+            content = json.load(offsetsfile)
+            AH_offset = content['AH_offset']
+            DEC_offset = content['DEC_offset']
+            print ("[+] Datos de Calibracion Actuales: ")
+            print('AH_offset: {}'.format(content['AH_offset']))
+            print('DEC_offset: {}'.format(content['DEC_offset']))
+            AH = AH + AH_offset
+            DEC = DEC + DEC_offset
+    except:
+        AH = AH
+        DEC = DEC
+        print ("[*]ERROR - Mala lectura del archivo de calibración")
+        pass
+
+    h = int(AH)
+    m = int((AH*60) % 60)
+    s = int((AH*3600) % 60)
+    if h >= 0:
+        AHpretty = timedelta(hours=h, minutes=m, seconds=s)
+    else:
+        AHpretty = -timedelta(hours=h, minutes=m, seconds=s)
+    AHpretty =  str(AHpretty)
+
+    #data = {'AH':AH, 'DEC':DEC, 'AHpretty':AHpretty}
+    data = {'AH':AH, 'DEC':DEC}
+    return data
+
+
+def calibra_inclinometro2m(iteraciones):
+    xtempval = 0
+    ytempval = 0
+    ztempval = 0
+    data = 0
+    AH_offset = 0
+    DEC_offset = 0
+    FirstInitSensor()
+
+    for i in range(iteraciones):
+        try:
+            #data = sensor.acceleration
+            data = sensor.read_accelerometer()
+        except:
+            data = 0
+            print ("[*]ERROR - Mala lectura del sensor")
+            pass
+        xtempval = xtempval + data[0]
+        ytempval = ytempval + data[1]
+        ztempval = ztempval + data[2]
+        time.sleep(0.01)
+
+    x = xtempval / iteraciones
+    y = ytempval / iteraciones
+    z = ztempval / iteraciones
+
+    try:
+        angleYZ = math.atan( y / math.sqrt(x**2 + z**2))
+        angleYZ = angleYZ*(180.0/math.pi) # Convierte de radianes a grados
+        angleYZ = angleYZ/15
+        AH = angleYZ
+
+        angleXZ = math.atan(x / math.sqrt(y**2+z**2))
+        angleXZ = angleXZ*(180.0/math.pi) # Convierte de radianes a grados
+        angleXZ = angleXZ + 31.02025  # Latitud OAN-SPM
+        DEC = angleXZ
+    except:
+        AH = 0
+        DEC = 0
+        print ("[*]ERROR - Mala lectura del sensor")
+        pass
+
+    AH_offset = 0 - AH
+    DEC_offset = 31.02025 - DEC   # Latitud OAN-SPM
+
+    # Data to be written
+    dictionary = {
+                'AH_offset': AH_offset,
+                'DEC_offset': DEC_offset
+                 }
+    # Serializing json
+    json_object = json.dumps(dictionary, separators=(',', ':'), sort_keys=True)
+    # Writing to sample.json
+    with open('/home/pi/Inclinometro2m/offset.json', 'w') as outfile:
+        outfile.write(json_object)
+
+    data = {'AH':AH, 'DEC':DEC, 'AH_offset':AH_offset, 'DEC_offset':DEC_offset}
+    return data
+
+
+# El primer dato es basura, leerlo una vez para descartarlo
+#sensor.acceleration    sensor.read_accelerometer()
+def FirstInitSensor():
+    print("[+] Primera lectura de prueba al sensor: {}".format(sensor.read_accelerometer()))
+    time.sleep(0.20)
+    print("[+] Segunda lectura de prueba al sensor: {}".format(sensor.read_accelerometer()))
+    time.sleep(0.20)
+    print("[+] Tercera lectura de prueba al sensor: {}".format(sensor.read_accelerometer()))
+    time.sleep(0.20)
+    print("[+] Cuarta lectura de prueba al sensor: {}".format(sensor.read_accelerometer()))
+    time.sleep(0.20)
+    print("[+] Quinta lectura de prueba al sensor: {}".format(sensor.read_accelerometer()))
+    time.sleep(0.20)
+    print("[+] Sensor del Inclinometro Inicializado y Estabilizado")
+
+
+# Multithreaded Python server : TCP Server Socket Thread Pool
+class ClientThread(Thread):
+    def __init__(self, ip, port, conn):
+        Thread.__init__(self)
+        self.ip = ip
+        self.port = port
+        self.conn = conn
+        print ("[+] Nuevo server socket thread iniciado desde " + ip + ":" + str(port))
+        #self.conn.send(str.encode('Bienvenido '+ ip + ' procesando comando...' + '\n'))    # lo quite por errores en el json
+
+
+    def run(self):
+        global TapasTimer
+        global BuscadorTimer
+        while True:
+            data = self.conn.recv(2048).strip()
+            if not data:
+                print ("Comando Recibido: NO DATA")
+                break
+            #message_queues[self.conn].put(data)
+            data = data.decode('utf-8') # decodificar el mensaje
+            data = data.upper() # convertir a mayusculas
+            print ("Comando Recibido: " + data)
+            datasplit = data.split(' ')
+            comando = datasplit[0]
+            print (datasplit) #debug
+            time.sleep(0.20)
+
+            # Comandos
+            # Abrir tapas del espejo primario y buscador.
+            if comando == ':ABRIR;' or comando == 'OPENALL':        #EJEMPLO: echo :ABRIR; | nc 192.168.0.20 4545
+                if TapasTimer:
+                    TapasTimer.cancel()
+                    TapasTimer = None
+                if BuscadorTimer:
+                    BuscadorTimer.cancel()
+                    BuscadorTimer = None
+                time.sleep(0.20)
+                abreTapaNorte()
+                try:
+                    self.conn.send(str.encode('OK: ' + data + '\n'))  # echo
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                time.sleep(5)
+                abreTapaSur()
+                time.sleep(0.20)
+                abreBuscador()
+                time.sleep(0.20)
+                break
+
+
+            # Cerrar tapas del espejo primario y buscador.
+            elif comando == ':CERRAR;' or comando == 'CLOSEALL':        #EJEMPLO: echo :CERRAR; | nc 192.168.0.20 4545
+                if TapasTimer:
+                    TapasTimer.cancel()
+                    TapasTimer = None
+                if BuscadorTimer:
+                    BuscadorTimer.cancel()
+                    BuscadorTimer = None
+                time.sleep(0.20)
+                cierraTapaSur()
+                try:
+                    self.conn.send(str.encode('OK: ' + data + '\n'))  # echo
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                time.sleep(5)
+                cierraTapaNorte()
+                time.sleep(0.20)
+                cierraBuscador()
+                time.sleep(0.20)
+                break
+
+
+            # Abre buscador.
+            elif comando == ':AB;' or comando == 'OPENBUSCA':        #EJEMPLO: echo :AB; | nc 192.168.0.20 4545
+                if BuscadorTimer:
+                    BuscadorTimer.cancel()
+                    BuscadorTimer = None
+                time.sleep(0.20)
+                abreBuscador()
+                time.sleep(0.20)
+                try:
+                    self.conn.send(str.encode('OK: ' + data + '\n'))  # echo
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+            # Cierra buscador.
+            elif comando == ':CB;' or comando == 'CLOSEBUSCA':        #EJEMPLO: echo :CB; | nc 192.168.0.20 4545
+                if BuscadorTimer:
+                    BuscadorTimer.cancel()
+                    BuscadorTimer = None
+                time.sleep(0.20)
+                cierraBuscador()
+                time.sleep(0.20)
+                try:
+                    self.conn.send(str.encode('OK: ' + data + '\n'))  # echo
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+            # Abrir tapas del espejo primario.
+            if comando == 'OPENTAPAS':        #EJEMPLO: echo OPENTAPAS | nc 192.168.0.20 4545
+                if TapasTimer:
+                    TapasTimer.cancel()
+                    TapasTimer = None
+                time.sleep(0.20)
+                abreTapaNorte()
+                try:
+                    self.conn.send(str.encode('OK: ' + data + '\n'))  # echo
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                time.sleep(5)
+                abreTapaSur()
+                time.sleep(0.20)
+                break
+
+
+            # Cerrar tapas del espejo primario.
+            elif comando == 'CLOSETAPAS':        #EJEMPLO: echo CLOSETAPAS | nc 192.168.0.20 4545
+                if TapasTimer:
+                    TapasTimer.cancel()
+                    TapasTimer = None
+                time.sleep(0.20)
+                cierraTapaSur()
+                try:
+                    self.conn.send(str.encode('OK: ' + data + '\n'))  # echo
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                time.sleep(5)
+                cierraTapaNorte()
+                time.sleep(0.20)
+                break
+
+
+            #Regresa Estado ACTUAL
+            elif comando == 'ESTADO' or comando == 'STATUS' or comando == ':?TA;':  #EJEMPLO: echo ESTADO | nc 192.168.0.20 4545
+                variables.TAPA_NORTE_ABIERTA = GPIO.input(TAPA_NORTE_ABIERTA_PIN)
+                variables.TAPA_NORTE_CERRADA = GPIO.input(TAPA_NORTE_CERRADA_PIN)
+                variables.TAPA_SUR_ABIERTA = GPIO.input(TAPA_SUR_ABIERTA_PIN)
+                variables.TAPA_SUR_CERRADA = GPIO.input(TAPA_SUR_CERRADA_PIN)
+                variables.BUSCA_ABIERTO = GPIO.input(BUSCA_ABIERTO_PIN)
+                variables.BUSCA_CERRADO = GPIO.input(BUSCA_CERRADO_PIN)
+
+                estado = {
+                        'TAPA_NORTE_ABIERTA': variables.TAPA_NORTE_ABIERTA,
+                        'TAPA_NORTE_CERRADA': variables.TAPA_NORTE_CERRADA,
+                        'TAPA_SUR_ABIERTA': variables.TAPA_SUR_ABIERTA,
+                        'TAPA_SUR_CERRADA': variables.TAPA_SUR_CERRADA,
+                        'BUSCADOR_ABIERTO': variables.BUSCA_ABIERTO,
+                        'BUSCADOR_CERRADO': variables.BUSCA_CERRADO,
+                        'ABRE_BUSCADOR': variables.ABRE_BUSCADOR,
+                        'CIERRA_BUSCADOR': variables.CIERRA_BUSCADOR,
+                        'ABRE_TAPA_NORTE': variables.ABRE_TAPA_NORTE,
+                        'CIERRA_TAPA_NORTE': variables.CIERRA_TAPA_NORTE,
+                        'ABRE_TAPA_SUR': variables.ABRE_TAPA_SUR,
+                        'CIERRA_TAPA_SUR': variables.CIERRA_TAPA_SUR,
+                        'TAPA_NORTE_STOP': variables.TAPA_NORTE_STOP,
+                        'TAPA_SUR_STOP': variables.TAPA_SUR_STOP,
+                        'BUSCADOR_STOP': variables.BUSCADOR_STOP
+                        }
+                estado_json = json.dumps(estado, separators=(',', ':'), sort_keys=True) #data serialized
+                print ("[+] Estado ACTUAL: ")
+                print (estado_json)
+                try:
+                    self.conn.send(str.encode(estado_json + '\n'))
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+            #Regresa Inclinometro ACTUAL
+            elif comando == 'DATA':    #EJEMPLO: echo DATA | nc 192.168.0.20 4545
+                time.sleep(.25)
+                data = inclinometroPromediado(1)
+                AH = data['AH']
+                DEC = data['DEC']
+                inclinometro = {
+                        'DEC': DEC,
+                        'AH': AH
+                        }
+                inclinometro_json = json.dumps(inclinometro, separators=(',', ':'), sort_keys=True) #data serialized
+                print ("[+] Inclinometro ACTUAL: ")
+                print (inclinometro_json)
+                try:
+                    self.conn.send(str.encode(inclinometro_json + '\n'))
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+            #Regresa Inclinometro con filtrado ACTUAL
+            elif comando == 'INCLINOMETRO':    #EJEMPLO: echo INCLINOMETRO 10 | nc 192.168.0.20 4545
+                try:
+                    iteraciones = int(datasplit[1])
+                except:
+                    iteraciones = 1
+                    pass
+                if iteraciones >=1 :
+                    iteraciones = iteraciones
+                elif iteraciones <1:
+                    iteraciones = 1
+                else:
+                    iteraciones = 1
+                print("Iteraciones del Inclinometro: ", iteraciones)
+                time.sleep(.25)
+                data = inclinometroPromediado(iteraciones)
+                AH = data['AH']
+                DEC = data['DEC']
+                inclinometro = {
+                        'DEC': DEC,
+                        'AH': AH
+                        }
+                inclinometro_json = json.dumps(inclinometro, separators=(',', ':'), sort_keys=True) #data serialized
+                print ("[+] Inclinometro ACTUAL: ")
+                print (inclinometro_json)
+                try:
+                    self.conn.send(str.encode(inclinometro_json + '\n'))
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+            #Genera offsets de calibración
+            elif comando == 'CALIBRA':    #EJEMPLO: echo CALIBRA | nc 192.168.0.20 4545
+                time.sleep(.25)
+                data = calibra_inclinometro2m(100)
+                AH = data['AH']
+                DEC = data['DEC']
+                AH_offset = data['AH_offset']
+                DEC_offset = data['DEC_offset']
+                calibracion = {
+                        'DEC': DEC,
+                        'AH': AH,
+                        'AH_offset': AH_offset,
+                        'DEC_offset': DEC_offset
+                        }
+                calibracion_json = json.dumps(calibracion, separators=(',', ':'), sort_keys=True) #data serialized
+                print ("[+] Calibracion generada: ")
+                print (calibracion_json)
+                try:
+                    self.conn.send(str.encode(calibracion_json + '\n'))
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+            #Lee y envia los offsets de calibración
+            elif comando == 'OFFSETS':    #EJEMPLO: echo OFFSETS | nc 192.168.0.20 4545
+                time.sleep(.25)
+                try:
+                    #print("[+] Datos de Calibración Actuales:")
+                    with open('/home/pi/Inclinometro2m/offset.json') as jsonfile:
+                        content = json.load(jsonfile)
+                        #print('AH_offset: {}'.format(content['AH_offset']))
+                        #print('DEC_offset: {}'.format(content['DEC_offset']))
+                        AH_offset = content['AH_offset']
+                        DEC_offset = content['DEC_offset']
+                except:
+                    print ("[*]ERROR - Sin archivo de calibración")
+                    AH_offset = 0
+                    DEC_offset = 0
+                    pass
+                offsets = {
+                        'AH_offset': AH_offset,
+                        'DEC_offset': DEC_offset
+                        }
+                offsets_json = json.dumps(offsets, separators=(',', ':'), sort_keys=True) #data serialized
+                print ("[+] Calibracion actual: ")
+                print (offsets_json)
+                try:
+                    self.conn.send(str.encode(offsets_json + '\n'))
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+            # apaga motores
+            elif comando == 'STOP':
+                if TapasTimer:
+                    TapasTimer.cancel()
+                    TapasTimer = None
+                if BuscadorTimer:
+                    BuscadorTimer.cancel()
+                    BuscadorTimer = None
+                time.sleep(0.20)
+                turnOffMotors()
+                print ("[+] MOTORES OFF")
+                try:
+                    self.conn.send(str.encode('OK: ' + data + '\n'))  # echo
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+            elif comando == 'EXIT':
+                now = time.strftime('%Y-%m-%d %H:%M')
+                print(now + ' - Conexion Terminada por el Cliente')
+                try:
+                    self.conn.send(str.encode('Recibido: Adios' + '\n'))
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+            else:
+                now = time.strftime('%Y-%m-%d %H:%M')
+                print(now + ' - No Existe el Comando - Conexion Terminada')
+                try:
+                    self.conn.send(str.encode('Adios' + '\n'))  # echo
+                except BrokenPipeError as e:
+                    pass
+                self.conn.close()
+                break
+
+
+
+# Programa Principal
+try:
+    variables=Inclinometro2m_variables.Variables()           #Variables
+
+    try:
+        turnOffMotors()
+    except:
+        print ("[-] ERROR APAGANDO MOTORES AL INICIO")
+        pass
+
+    principal = Principal()
+    principal.run()
+
+    print ("[+] SERVIDOR DE INCLINOMETRO DEL TEL2.1M Iniciado! Presione CTRL+C para Salir")
+    # become a server socket
+    tcpServer.listen(5)
+
+    FirstInitSensor()
+    time.sleep(2)
+    try:
+        print("[+] Datos de Calibración Actuales:")
+        with open('/home/pi/Inclinometro2m/offset.json') as jsonfile:
+            content = json.load(jsonfile)
+            print('AH_offset: {}'.format(content['AH_offset']))
+            print('DEC_offset: {}'.format(content['DEC_offset']))
+    except:
+        print ("[*]ERROR - Sin archivo de calibración - Omitiendo")
+        pass
+
+    while True:
+        print ("Esperando por Conexiones en el puerto: " + str(TCP_PORT))
+        (conn, (ip, port)) = tcpServer.accept()
+        threadSockets = ClientThread(ip, port, conn)
+        threadSockets.daemon = True
+        threadSockets.start()
+        #threads.append(threadSockets)
+        #message_queues[threadSockets] = Queue.Queue()
+
+    tcpServer.shutdown()
+    tcpServer.close()
+    # wait until worker threads are done to exit
+    for t in threads:
+        t.join()
+
+
+
+except (KeyboardInterrupt, SystemExit): # If CTRL+C is pressed, exit cleanly:
+    try:
+        turnOffMotors()
+    except:
+        print ("[-] ERROR APAGANDO MOTORES AL SALIR")
+        pass
+    GPIO.cleanup()
+    print ("Adios Viajero")
+    tcpServer.shutdown(socket.SHUT_RDWR)
+    tcpServer.close()
+    sys.exit()
